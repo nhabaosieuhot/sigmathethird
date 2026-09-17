@@ -559,7 +559,3 @@ install()
 cheat.register("newPlace", function()
     pcall(M.Flush)
 end)
-
-for k, v in next, game.Workspace.Part:GetAttributes() do
-    print(k,v)
-end
