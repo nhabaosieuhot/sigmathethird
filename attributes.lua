@@ -19,9 +19,8 @@ local MAX_STRING     = 512
 local MAX_RECORDS    = 4096
 local MAX_CMAP_BYTES = 0x4000
 local MAX_TYPE_NAME  = 32
-local MAX_NAME       = 128
 
-local BUILD = "r22-dual-string-layout"
+local BUILD = "r17d"
 
 local M = {}
 
@@ -56,69 +55,38 @@ local function printable(s)
     return true
 end
 
--- memory.Read("string") scans to a NUL and will read straight off the end of a
--- mapped page into unmapped memory, taking the cheat process with it. Every string
--- here is read byte by byte inside a proven span instead.
-local function readChars(addr, maxLen)
-    if not valid(addr) then return nil end
-
-    local room = 0x1000 - (addr % 0x1000)
-    if maxLen > room and not valid(addr + maxLen - 1) then maxLen = room end
-
-    local out = {}
-    for i = 0, maxLen - 1 do
-        local b = rd("byte", addr + i)
-        if not b or b == 0 then break end
-        if b < 0x20 or b > 0x7E then return nil end
-        out[#out + 1] = string.char(b)
-    end
-    if #out == 0 then return nil end
-    return table.concat(out)
-end
-
--- Two string shapes exist: a plain MSVC std::string, and one behind an 8-byte
--- prefix. Which one a field uses varies by build, so both are tried and the
--- layout that decoded is handed back for the writer to reuse.
-local STR_LAYOUT = {
-    { Chars = 0x00, Size = 0x10, Cap = 0x18 },
-    { Chars = 0x08, Size = 0x18, Cap = 0x20 },
-}
-
-local function readStringAt(addr)
-    if not valid(addr) then return nil end
-
-    for _, L in ipairs(STR_LAYOUT) do
-        local size = rd("uint64", addr + L.Size)
-        local cap  = rd("uint64", addr + L.Cap)
-        if type(size) == "number" and type(cap) == "number"
-            and size > 0 and size <= MAX_STRING and cap >= size and cap <= 0x40000000 then
-
-            local src = addr + L.Chars
-            if cap >= 16 then
-                local p = rd("pointer", addr + L.Chars)
-                src = valid(p) and p or nil
-            end
-
-            local text = src and readChars(src, size) or nil
-            if text and #text == size then return text, L end
-        end
-    end
-    return nil
-end
-
 local function readStdString(addr)
-    return (readStringAt(addr))
+    if not valid(addr) then return nil end
+
+    local size = rd("uint64", addr + 0x10)
+    local cap  = rd("uint64", addr + 0x18)
+    if type(size) ~= "number" or type(cap) ~= "number" then return nil end
+    if size == 0 or size > MAX_STRING then return nil end
+    if cap < size or cap > 0x40000000 then return nil end
+
+    local src = addr
+    if cap >= 16 then
+        local p = rd("pointer", addr)
+        if not valid(p) then return nil end
+        src = p
+    end
+
+    local s = rd("string", src)
+    if type(s) ~= "string" or #s == 0 then return nil end
+    if #s > size then s = string.sub(s, 1, size) end
+    return s
 end
 
 local function readCString(addr)
-    local s = readStringAt(addr)
-    if s and #s >= 3 and #s <= MAX_TYPE_NAME then return s end
-    s = readChars(addr, MAX_TYPE_NAME)
-    return (s and #s >= 3) and s or nil
+    local s = valid(addr) and rd("string", addr) or nil
+    return (type(s) == "string" and #s >= 3 and #s <= MAX_TYPE_NAME and printable(s)) and s or nil
 end
 
 local function readKeyName(addr)
-    return readStdString(addr) or readChars(addr, MAX_NAME)
+    local s = readStdString(addr)
+    if s then return s end
+    local c = valid(addr) and rd("string", addr) or nil
+    return (type(c) == "string" and #c > 0 and #c <= MAX_STRING and printable(c)) and c or nil
 end
 
 local function tagged(ty, ...)
@@ -195,7 +163,8 @@ DEC["Rect2D"] = DEC["Rect"]
 DEC["CoordinateFrame"] = function(va) return floats(va, 12, "CFrame") end
 
 DEC["string"] = function(va)
-    return readStdString(va) or readChars(va, MAX_STRING) or ""
+    local c = rd("string", va)
+    return readStdString(va) or ((type(c) == "string" and printable(c)) and c or "")
 end
 DEC["std::string"] = DEC["string"]
 DEC["Content"]     = DEC["string"]
@@ -302,23 +271,15 @@ local function attrTypeName(ent)
     return name
 end
 
-local function attrMapFor(inst, fresh)
+local function attrMapFor(inst)
     local addr = instanceAddress(inst)
     if not addr then return nil end
 
-    -- Instance addresses get recycled, so a cached map can belong to a dead object.
-    -- The entry is only trusted while the instance still points at the same
-    -- component map. Writes never trust it at all.
-    local cmap = rd("pointer", addr + OFF.Instance.ComponentMap)
-    if not valid(cmap) then return nil end
-
-    if not fresh then
-        local hit = AttrMapCache[addr]
-        if hit and hit.cmap == cmap then return hit.map or nil end
-    end
+    local cached = AttrMapCache[addr]
+    if cached ~= nil then return cached or nil end
 
     local map = findAttrMap(addr)
-    AttrMapCache[addr] = { cmap = cmap, map = map or false }
+    AttrMapCache[addr] = map or false
     return map
 end
 
@@ -490,42 +451,37 @@ ENC["string"] = function(va, value)
     local text = tostring(value)
     if #text > MAX_STRING then return false, "string too long" end
 
-    -- Only ever written through a layout that was successfully read back, so the
-    -- bytes at va are known to be a string header and not something else.
-    local current, L = readStringAt(va)
-    if not L then
-        return false, "string layout not recognised, refusing to write"
+    local oldSize = rd("uint64", va + 0x10)
+    local cap     = rd("uint64", va + 0x18)
+    if type(oldSize) ~= "number" or type(cap) ~= "number" or cap > 0x40000000 then
+        return false, "payload is not a std::string, cannot size the buffer"
     end
 
-    local cap = rd("uint64", va + L.Cap)
-    if type(cap) ~= "number" then return false, "capacity unreadable" end
+    local chars, limit = va, 15
+    if cap >= 16 then
+        chars = rd("pointer", va)
+        if not valid(chars) then return false, "heap buffer pointer is bad" end
+        limit = cap
+    end
+    if #text > limit then
+        return false, "buffer holds " .. limit .. " chars, " .. #text .. " given"
+    end
 
-    if cap < 16 then
-        if #text > 15 then
-            return false, "inline buffer holds 15 chars, " .. #text .. " given"
-        end
-        local chars = va + L.Chars
-        for i = 0, 15 do
-            local b = (i < #text) and string.byte(text, i + 1) or 0
-            if not wr("byte", chars + i, b) then return false, "write failed" end
-        end
-    else
-        if #text > cap then
-            return false, "capacity is " .. cap .. ", " .. #text .. " given"
-        end
-        local heap = rd("pointer", va + L.Chars)
-        if not valid(heap) then return false, "heap buffer pointer is bad" end
-        for i = 0, #text do
-            local b = (i < #text) and string.byte(text, i + 1) or 0
-            if not wr("byte", heap + i, b) then return false, "write failed" end
+    -- Byte by byte, never a string write. Every byte the old value occupied past
+    -- the new end is zeroed, so no tail of the previous string survives and the
+    -- terminator lands whether the new text is longer or shorter.
+    local last = oldSize
+    if last > limit then last = limit end
+    if last < #text then last = #text end
+
+    for i = 0, last do
+        local b = (i < #text) and string.byte(text, i + 1) or 0
+        if not wr("byte", chars + i, b) then
+            return false, "write failed at byte " .. i
         end
     end
 
-    if not wr("uint64", va + L.Size, #text) then return false, "length write failed" end
-    if readStringAt(va) ~= text then
-        return false, "readback mismatch, write did not land cleanly"
-    end
-    return true
+    return wr("uint64", va + 0x10, #text), "length write failed"
 end
 ENC["std::string"] = ENC["string"]
 ENC["Content"]     = ENC["string"]
@@ -535,7 +491,7 @@ function M.SetAttribute(inst, name, value)
         return false, "name must be a non-empty string"
     end
 
-    local map = attrMapFor(inst, true)
+    local map = attrMapFor(inst)
     if not map then return false, "instance has no attribute map" end
 
     local n, ents = amapView(map)
@@ -574,16 +530,18 @@ do
     local flush   = function(self)       M.Flush() return true end
     local setOne  = function(self, name, value) return M.SetAttribute(self, name, value) end
 
-    HOOKS.Attributes         = getAll
-    HOOKS.attributes         = getAll
-    HOOKS.Attribute          = getOne
-    HOOKS.attribute          = getOne
-    HOOKS.AttributeInfo      = getInfo
-    HOOKS.attributeInfo      = getInfo
-    HOOKS.attribute_info     = getInfo
-    HOOKS.SetAttr            = setOne
-    HOOKS.setAttr            = setOne
-    HOOKS.set_attr           = setOne
+    HOOKS.GetAttributes      = getAll
+    HOOKS.getAttributes      = getAll
+    HOOKS.get_attributes     = getAll
+    HOOKS.GetAttribute       = getOne
+    HOOKS.getAttribute       = getOne
+    HOOKS.get_attribute      = getOne
+    HOOKS.GetAttributeInfo   = getInfo
+    HOOKS.getAttributeInfo   = getInfo
+    HOOKS.get_attribute_info = getInfo
+    HOOKS.SetAttribute       = setOne
+    HOOKS.setAttribute       = setOne
+    HOOKS.set_attribute      = setOne
     HOOKS.FlushAttributes    = flush
     HOOKS.flushAttributes    = flush
     HOOKS.flush_attributes   = flush
@@ -599,8 +557,8 @@ local function attach(inst)
         for k, fn in pairs(HOOKS) do mt[k] = fn end
     end)
 
-    local okf, f = pcall(function() return inst.Attributes end)
-    return okf and f == HOOKS.Attributes
+    local okf, f = pcall(function() return inst.GetAttributes end)
+    return okf and f == HOOKS.GetAttributes
 end
 
 local function install()
