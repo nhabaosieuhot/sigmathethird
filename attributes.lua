@@ -21,7 +21,7 @@ local MAX_CMAP_BYTES = 0x4000
 local MAX_TYPE_NAME  = 32
 local MAX_NAME       = 128
 
-local BUILD = "r21"
+local BUILD = "r22-dual-string-layout"
 
 local M = {}
 
@@ -76,27 +76,44 @@ local function readChars(addr, maxLen)
     return table.concat(out)
 end
 
-local function readStdString(addr)
+-- Two string shapes exist: a plain MSVC std::string, and one behind an 8-byte
+-- prefix. Which one a field uses varies by build, so both are tried and the
+-- layout that decoded is handed back for the writer to reuse.
+local STR_LAYOUT = {
+    { Chars = 0x00, Size = 0x10, Cap = 0x18 },
+    { Chars = 0x08, Size = 0x18, Cap = 0x20 },
+}
+
+local function readStringAt(addr)
     if not valid(addr) then return nil end
 
-    local size = rd("uint64", addr + 0x10)
-    local cap  = rd("uint64", addr + 0x18)
-    if type(size) ~= "number" or type(cap) ~= "number" then return nil end
-    if size == 0 or size > MAX_STRING then return nil end
-    if cap < size or cap > 0x40000000 then return nil end
+    for _, L in ipairs(STR_LAYOUT) do
+        local size = rd("uint64", addr + L.Size)
+        local cap  = rd("uint64", addr + L.Cap)
+        if type(size) == "number" and type(cap) == "number"
+            and size > 0 and size <= MAX_STRING and cap >= size and cap <= 0x40000000 then
 
-    local src = addr
-    if cap >= 16 then
-        local p = rd("pointer", addr)
-        if not valid(p) then return nil end
-        src = p
+            local src = addr + L.Chars
+            if cap >= 16 then
+                local p = rd("pointer", addr + L.Chars)
+                src = valid(p) and p or nil
+            end
+
+            local text = src and readChars(src, size) or nil
+            if text and #text == size then return text, L end
+        end
     end
+    return nil
+end
 
-    return readChars(src, size)
+local function readStdString(addr)
+    return (readStringAt(addr))
 end
 
 local function readCString(addr)
-    local s = readChars(addr, MAX_TYPE_NAME)
+    local s = readStringAt(addr)
+    if s and #s >= 3 and #s <= MAX_TYPE_NAME then return s end
+    s = readChars(addr, MAX_TYPE_NAME)
     return (s and #s >= 3) and s or nil
 end
 
@@ -470,38 +487,42 @@ ENC["Rect2D"]      = ENC["Rect"]
 ENC["CoordinateFrame"] = function(va, v) return writeFloats(va, v, 12, "CFrame") end
 
 ENC["string"] = function(va, value)
-    local str = tostring(value)
-    if #str > MAX_STRING then return false, "string too long" end
+    local text = tostring(value)
+    if #text > MAX_STRING then return false, "string too long" end
 
-    -- The payload must be provably an MSVC std::string before anything is written.
-    -- Attribute KEYS are char*, so the value may be too; on that layout the bytes at
-    -- va are a pointer, and writing chars over it destroys it and crashes the game.
-    local current = readStdString(va)
-    if not current then
-        return false, "payload is not a verified std::string, refusing to write"
+    -- Only ever written through a layout that was successfully read back, so the
+    -- bytes at va are known to be a string header and not something else.
+    local current, L = readStringAt(va)
+    if not L then
+        return false, "string layout not recognised, refusing to write"
     end
 
-    local cap = rd("uint64", va + 0x18)
-    if type(cap) ~= "number" or cap > 0x40000000 then
-        return false, "capacity unreadable"
-    end
+    local cap = rd("uint64", va + L.Cap)
+    if type(cap) ~= "number" then return false, "capacity unreadable" end
 
     if cap < 16 then
-        if #str > 15 then
-            return false, "inline buffer holds 15 chars, " .. #str .. " given"
+        if #text > 15 then
+            return false, "inline buffer holds 15 chars, " .. #text .. " given"
         end
-        if not wr("string", va, str) then return false, "write failed" end
+        local chars = va + L.Chars
+        for i = 0, 15 do
+            local b = (i < #text) and string.byte(text, i + 1) or 0
+            if not wr("byte", chars + i, b) then return false, "write failed" end
+        end
     else
-        local heap = rd("pointer", va)
-        if not valid(heap) then return false, "heap buffer pointer is bad" end
-        if #str > cap then
-            return false, "capacity is " .. cap .. ", " .. #str .. " given"
+        if #text > cap then
+            return false, "capacity is " .. cap .. ", " .. #text .. " given"
         end
-        if not wr("string", heap, str) then return false, "write failed" end
+        local heap = rd("pointer", va + L.Chars)
+        if not valid(heap) then return false, "heap buffer pointer is bad" end
+        for i = 0, #text do
+            local b = (i < #text) and string.byte(text, i + 1) or 0
+            if not wr("byte", heap + i, b) then return false, "write failed" end
+        end
     end
 
-    if not wr("uint64", va + 0x10, #str) then return false, "length write failed" end
-    if readStdString(va) ~= str then
+    if not wr("uint64", va + L.Size, #text) then return false, "length write failed" end
+    if readStringAt(va) ~= text then
         return false, "readback mismatch, write did not land cleanly"
     end
     return true
