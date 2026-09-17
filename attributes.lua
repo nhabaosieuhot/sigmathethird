@@ -19,8 +19,9 @@ local MAX_STRING     = 512
 local MAX_RECORDS    = 4096
 local MAX_CMAP_BYTES = 0x4000
 local MAX_TYPE_NAME  = 32
+local MAX_NAME       = 128
 
-local BUILD = "r19-no-stale-map"
+local BUILD = "r21"
 
 local M = {}
 
@@ -55,6 +56,26 @@ local function printable(s)
     return true
 end
 
+-- memory.Read("string") scans to a NUL and will read straight off the end of a
+-- mapped page into unmapped memory, taking the cheat process with it. Every string
+-- here is read byte by byte inside a proven span instead.
+local function readChars(addr, maxLen)
+    if not valid(addr) then return nil end
+
+    local room = 0x1000 - (addr % 0x1000)
+    if maxLen > room and not valid(addr + maxLen - 1) then maxLen = room end
+
+    local out = {}
+    for i = 0, maxLen - 1 do
+        local b = rd("byte", addr + i)
+        if not b or b == 0 then break end
+        if b < 0x20 or b > 0x7E then return nil end
+        out[#out + 1] = string.char(b)
+    end
+    if #out == 0 then return nil end
+    return table.concat(out)
+end
+
 local function readStdString(addr)
     if not valid(addr) then return nil end
 
@@ -71,22 +92,16 @@ local function readStdString(addr)
         src = p
     end
 
-    local s = rd("string", src)
-    if type(s) ~= "string" or #s == 0 then return nil end
-    if #s > size then s = string.sub(s, 1, size) end
-    return s
+    return readChars(src, size)
 end
 
 local function readCString(addr)
-    local s = valid(addr) and rd("string", addr) or nil
-    return (type(s) == "string" and #s >= 3 and #s <= MAX_TYPE_NAME and printable(s)) and s or nil
+    local s = readChars(addr, MAX_TYPE_NAME)
+    return (s and #s >= 3) and s or nil
 end
 
 local function readKeyName(addr)
-    local s = readStdString(addr)
-    if s then return s end
-    local c = valid(addr) and rd("string", addr) or nil
-    return (type(c) == "string" and #c > 0 and #c <= MAX_STRING and printable(c)) and c or nil
+    return readStdString(addr) or readChars(addr, MAX_NAME)
 end
 
 local function tagged(ty, ...)
@@ -163,8 +178,7 @@ DEC["Rect2D"] = DEC["Rect"]
 DEC["CoordinateFrame"] = function(va) return floats(va, 12, "CFrame") end
 
 DEC["string"] = function(va)
-    local c = rd("string", va)
-    return readStdString(va) or ((type(c) == "string" and printable(c)) and c or "")
+    return readStdString(va) or readChars(va, MAX_STRING) or ""
 end
 DEC["std::string"] = DEC["string"]
 DEC["Content"]     = DEC["string"]
@@ -539,18 +553,16 @@ do
     local flush   = function(self)       M.Flush() return true end
     local setOne  = function(self, name, value) return M.SetAttribute(self, name, value) end
 
-    HOOKS.GetAttributes      = getAll
-    HOOKS.getAttributes      = getAll
-    HOOKS.get_attributes     = getAll
-    HOOKS.GetAttribute       = getOne
-    HOOKS.getAttribute       = getOne
-    HOOKS.get_attribute      = getOne
-    HOOKS.GetAttributeInfo   = getInfo
-    HOOKS.getAttributeInfo   = getInfo
-    HOOKS.get_attribute_info = getInfo
-    HOOKS.SetAttribute       = setOne
-    HOOKS.setAttribute       = setOne
-    HOOKS.set_attribute      = setOne
+    HOOKS.Attributes         = getAll
+    HOOKS.attributes         = getAll
+    HOOKS.Attribute          = getOne
+    HOOKS.attribute          = getOne
+    HOOKS.AttributeInfo      = getInfo
+    HOOKS.attributeInfo      = getInfo
+    HOOKS.attribute_info     = getInfo
+    HOOKS.SetAttr            = setOne
+    HOOKS.setAttr            = setOne
+    HOOKS.set_attr           = setOne
     HOOKS.FlushAttributes    = flush
     HOOKS.flushAttributes    = flush
     HOOKS.flush_attributes   = flush
@@ -566,8 +578,8 @@ local function attach(inst)
         for k, fn in pairs(HOOKS) do mt[k] = fn end
     end)
 
-    local okf, f = pcall(function() return inst.GetAttributes end)
-    return okf and f == HOOKS.GetAttributes
+    local okf, f = pcall(function() return inst.Attributes end)
+    return okf and f == HOOKS.Attributes
 end
 
 local function install()
