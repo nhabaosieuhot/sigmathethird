@@ -20,7 +20,7 @@ local MAX_RECORDS    = 4096
 local MAX_CMAP_BYTES = 0x4000
 local MAX_TYPE_NAME  = 32
 
-local BUILD = "r17"
+local BUILD = "r19-no-stale-map"
 
 local M = {}
 
@@ -271,15 +271,23 @@ local function attrTypeName(ent)
     return name
 end
 
-local function attrMapFor(inst)
+local function attrMapFor(inst, fresh)
     local addr = instanceAddress(inst)
     if not addr then return nil end
 
-    local cached = AttrMapCache[addr]
-    if cached ~= nil then return cached or nil end
+    -- Instance addresses get recycled, so a cached map can belong to a dead object.
+    -- The entry is only trusted while the instance still points at the same
+    -- component map. Writes never trust it at all.
+    local cmap = rd("pointer", addr + OFF.Instance.ComponentMap)
+    if not valid(cmap) then return nil end
+
+    if not fresh then
+        local hit = AttrMapCache[addr]
+        if hit and hit.cmap == cmap then return hit.map or nil end
+    end
 
     local map = findAttrMap(addr)
-    AttrMapCache[addr] = map or false
+    AttrMapCache[addr] = { cmap = cmap, map = map or false }
     return map
 end
 
@@ -448,29 +456,41 @@ ENC["Rect2D"]      = ENC["Rect"]
 ENC["CoordinateFrame"] = function(va, v) return writeFloats(va, v, 12, "CFrame") end
 
 ENC["string"] = function(va, value)
-    local s = tostring(value)
-    if #s > MAX_STRING then return false, "string too long" end
+    local str = tostring(value)
+    if #str > MAX_STRING then return false, "string too long" end
 
-    local size = rd("uint64", va + 0x10)
-    local cap  = rd("uint64", va + 0x18)
-    if type(size) ~= "number" or type(cap) ~= "number" or cap > 0x40000000 then
-        return false, "payload is not a std::string, cannot size the buffer"
+    -- The payload must be provably an MSVC std::string before anything is written.
+    -- Attribute KEYS are char*, so the value may be too; on that layout the bytes at
+    -- va are a pointer, and writing chars over it destroys it and crashes the game.
+    local current = readStdString(va)
+    if not current then
+        return false, "payload is not a verified std::string, refusing to write"
+    end
+
+    local cap = rd("uint64", va + 0x18)
+    if type(cap) ~= "number" or cap > 0x40000000 then
+        return false, "capacity unreadable"
     end
 
     if cap < 16 then
-        if #s > 15 then
-            return false, "inline buffer holds 15 chars, " .. #s .. " given"
+        if #str > 15 then
+            return false, "inline buffer holds 15 chars, " .. #str .. " given"
         end
-        if not wr("string", va, s) then return false, "write failed" end
+        if not wr("string", va, str) then return false, "write failed" end
     else
         local heap = rd("pointer", va)
         if not valid(heap) then return false, "heap buffer pointer is bad" end
-        if #s > cap then
-            return false, "capacity is " .. cap .. ", " .. #s .. " given"
+        if #str > cap then
+            return false, "capacity is " .. cap .. ", " .. #str .. " given"
         end
-        if not wr("string", heap, s) then return false, "write failed" end
+        if not wr("string", heap, str) then return false, "write failed" end
     end
-    return wr("uint64", va + 0x10, #s), "length write failed"
+
+    if not wr("uint64", va + 0x10, #str) then return false, "length write failed" end
+    if readStdString(va) ~= str then
+        return false, "readback mismatch, write did not land cleanly"
+    end
+    return true
 end
 ENC["std::string"] = ENC["string"]
 ENC["Content"]     = ENC["string"]
@@ -480,7 +500,7 @@ function M.SetAttribute(inst, name, value)
         return false, "name must be a non-empty string"
     end
 
-    local map = attrMapFor(inst)
+    local map = attrMapFor(inst, true)
     if not map then return false, "instance has no attribute map" end
 
     local n, ents = amapView(map)
